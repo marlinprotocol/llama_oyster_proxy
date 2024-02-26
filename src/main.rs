@@ -11,6 +11,7 @@ use k256::elliptic_curve::generic_array::sequence::Lengthen;
 use tiny_keccak::{Hasher, Keccak};
 use tokio::fs;
 use url::Url;
+use std::{time::Duration};
 
 /// Forwards the incoming HTTP request using `awc`.
 async fn forward(
@@ -25,7 +26,7 @@ async fn forward(
     new_url.set_query(req.uri().query());
     let forwarded_req = client
         .request_from(new_url.as_str(), req.head())
-        .no_decompress();
+        .no_decompress().timeout(Duration::new(60, 0));
 
     let forwarded_req = match peer_addr {
         Some(PeerAddr(addr)) => {
@@ -131,6 +132,8 @@ async fn main() -> std::io::Result<()> {
     );
 
     log::info!("forwarding to {forward_url}");
+
+
 
     HttpServer::new(move || {
         App::new()
