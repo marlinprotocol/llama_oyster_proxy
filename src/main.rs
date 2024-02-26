@@ -2,7 +2,7 @@ use std::{net::ToSocketAddrs, str::from_utf8};
 
 use actix_web::web::BytesMut;
 use actix_web::{
-    dev::PeerAddr, error, http::header, middleware, web, App, Error, HttpRequest, HttpResponse,
+    dev::PeerAddr, error, middleware, web, App, Error, HttpRequest, HttpResponse,
     HttpServer,
 };
 use alloy_rlp::{Encodable, RlpDecodable, RlpEncodable};
@@ -89,13 +89,6 @@ async fn forward(
     };
 
 
-    // get the host header value
-    let host_header = req
-        .headers()
-        .get(header::HOST)
-        .context("could not find Host header")
-        .and_then(|x| x.to_str().context("could not parse Host header"));
-    let host_header = host_header.unwrap().to_owned();
     let mut res = forwarded_req
         .send_json(&ollama_request_body)
         .await
@@ -122,18 +115,6 @@ async fn forward(
     hasher.update(b"|timestamp|");
     hasher.update(&timestamp.to_be_bytes());
 
-    hasher.update(b"|request|");
-    hasher.update(b"|method|");
-    hasher.update(req.method().to_string().as_bytes());
-    hasher.update(b"|pathandquery|");
-    hasher.update(
-        req.uri()
-            .path_and_query()
-            .map(|x| x.as_str())
-            .unwrap_or("")
-            .as_bytes(),
-    );
-
     let body = res.body().await?;
     let ollama_response: OllamaResponse = serde_json::from_str(from_utf8(&body)?)?;
     let model_name = ollama_response.model;
@@ -153,8 +134,6 @@ async fn forward(
 
     hasher.update(b"|ollama_signature_parameters|");
     hasher.update(&rlp_encoded_parameters);
-    hasher.update(b"|host|");
-    hasher.update(host_header.as_bytes());
 
     let mut hash = [0u8; 32];
     hasher.finalize(&mut hash);
