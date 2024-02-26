@@ -868,6 +868,8 @@ dependencies = [
  "hex",
  "k256",
  "log",
+ "serde",
+ "serde_json",
  "tiny-keccak",
  "tokio",
  "tokio-stream",

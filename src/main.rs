@@ -1,4 +1,4 @@
-use std::net::ToSocketAddrs;
+use std::{net::ToSocketAddrs, str::from_utf8};
 
 use actix_web::{
     dev::PeerAddr, error, http::header, middleware, web, App, Error, HttpRequest, HttpResponse,
@@ -8,10 +8,26 @@ use anyhow::Context;
 use awc::Client;
 use clap::Parser;
 use k256::elliptic_curve::generic_array::sequence::Lengthen;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
 use tiny_keccak::{Hasher, Keccak};
 use tokio::fs;
 use url::Url;
-use std::{time::Duration};
+use std::time::Duration;
+
+#[derive(Debug, Deserialize)]
+pub struct OllamaResponse {
+    pub model: String,
+    pub created_at: String,
+    pub response: String,
+    pub done: bool,
+    pub context: Vec<u128>,
+    pub total_duration: u128,
+    pub load_duration: u128,
+    pub prompt_eval_duration:u128,
+    pub eval_count: u128,
+    pub eval_duration: u128
+}
 
 /// Forwards the incoming HTTP request using `awc`.
 async fn forward(
@@ -42,14 +58,13 @@ async fn forward(
         .context("could not find Host header")
         .and_then(|x| x.to_str().context("could not parse Host header"));
     let host_header = host_header.unwrap().to_owned();
-
     let mut res = forwarded_req
         .send_stream(payload)
         .await
         .map_err(error::ErrorInternalServerError)?;
 
     let signer = k256::ecdsa::SigningKey::from_slice(
-        fs::read("/app/secp.sec")
+        fs::read("../app/secp.sec")
             .await
             .context("failed to read signer key")
             .unwrap()
@@ -80,7 +95,14 @@ async fn forward(
             .unwrap_or("")
             .as_bytes(),
     );
+    // let ollama_res = res.json::<OllamaResponse>().await.unwrap();
+    // log::info!("{}",ollama_res.response);
     let body = res.body().await?;
+    let ollama_response: OllamaResponse = serde_json::from_str(from_utf8(&body)?)?;
+    // let model_name = ollama_response.model;
+    // let model_response = ollama_response.response;
+    // let model_context = ollama_response.context;
+    
     hasher.update(b"|body|");
     hasher.update(&body);
     hasher.update(b"|host|");
