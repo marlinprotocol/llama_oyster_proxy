@@ -2,13 +2,12 @@ use std::{net::ToSocketAddrs, str::from_utf8};
 
 use actix_web::web::BytesMut;
 use actix_web::{
-    dev::PeerAddr, error, middleware, web, App, Error, HttpRequest, HttpResponse,
-    HttpServer,
+    dev::PeerAddr, error, middleware, web, App, Error, HttpRequest, HttpResponse, HttpServer,
 };
-use alloy_rlp::{Encodable, RlpDecodable, RlpEncodable};
 use anyhow::Context;
 use awc::Client;
 use clap::Parser;
+use ethabi::Token;
 use k256::elliptic_curve::generic_array::sequence::Lengthen;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -39,7 +38,7 @@ pub struct OllamaRequest {
     pub context: Option<Vec<u128>>,
 }
 
-#[derive(Debug, RlpEncodable, RlpDecodable, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub struct OllamaSignatureParameters {
     pub model: String,
     pub prompt: String,
@@ -62,7 +61,7 @@ async fn forward(
     let forwarded_req = client
         .request_from(new_url.as_str(), req.head())
         .no_decompress()
-        .timeout(Duration::new(60, 0));
+        .timeout(Duration::new(300, 0));
 
     let forwarded_req = match peer_addr {
         Some(PeerAddr(addr)) => {
@@ -87,7 +86,6 @@ async fn forward(
         Some(data) => serde_json::to_string(data)?,
         None => "[]".to_string(),
     };
-
 
     let mut res = forwarded_req
         .send_json(&ollama_request_body)
@@ -121,19 +119,16 @@ async fn forward(
     let model_response = ollama_response.response;
     let model_response_context = serde_json::to_string(&ollama_response.context)?;
 
-    let ollama_signature_parameters = OllamaSignatureParameters {
-        model: model_name,
-        prompt: model_prompt.to_string(),
-        request_context: model_request_context,
-        response: model_response,
-        response_context: model_response_context,
-    };
-
-    let mut rlp_encoded_parameters = Vec::<u8>::new();
-    ollama_signature_parameters.encode(&mut rlp_encoded_parameters);
+    let receipt = ethabi::encode(&[
+        Token::String(model_name),
+        Token::String(model_prompt.to_owned()),
+        Token::String(model_request_context),
+        Token::String(model_response),
+        Token::String(model_response_context),
+    ]);
 
     hasher.update(b"|ollama_signature_parameters|");
-    hasher.update(&rlp_encoded_parameters);
+    hasher.update(&receipt);
 
     let mut hash = [0u8; 32];
     hasher.finalize(&mut hash);
