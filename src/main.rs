@@ -16,16 +16,22 @@ use tokio::fs;
 use tokio_stream::StreamExt;
 use url::Url;
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Message {
+    pub role : String,
+    pub content : String
+}
+
 #[derive(Debug, Deserialize)]
 pub struct OllamaResponse {
     pub model: String,
     pub created_at: String,
-    pub response: String,
+    pub message: Message,
     pub done: bool,
-    pub context: Vec<u32>,
     pub total_duration: u128,
     pub load_duration: u128,
     pub prompt_eval_duration: u128,
+    pub prompt_eval_count: Option<u128>,
     pub eval_count: u128,
     pub eval_duration: u128,
 }
@@ -33,9 +39,8 @@ pub struct OllamaResponse {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct OllamaRequest {
     pub model: String,
-    pub prompt: String,
-    pub stream: Option<bool>,
-    pub context: Option<Vec<u128>>,
+    pub messages: Vec<Message>,
+    pub stream: Option<bool>
 }
 
 #[derive(Debug, PartialEq)]
@@ -81,11 +86,7 @@ async fn forward(
 
     ollama_request_body.stream = Some(false);
 
-    let model_prompt = &ollama_request_body.prompt;
-    let model_request_context = match &ollama_request_body.context {
-        Some(data) => serde_json::to_string(data)?,
-        None => "[]".to_string(),
-    };
+    let model_prompt = &ollama_request_body.messages[0].content;
 
     let mut res = forwarded_req
         .send_json(&ollama_request_body)
@@ -116,15 +117,13 @@ async fn forward(
     let body = res.body().await?;
     let ollama_response: OllamaResponse = serde_json::from_str(from_utf8(&body)?)?;
     let model_name = ollama_response.model;
-    let model_response = ollama_response.response;
-    let model_response_context = serde_json::to_string(&ollama_response.context)?;
+    let model_response = ollama_response.message.content;
+    log::info!("Response : {}",model_response);
 
     let receipt = ethabi::encode(&[
         Token::String(model_name),
         Token::String(model_prompt.to_owned()),
-        Token::String(model_request_context),
-        Token::String(model_response),
-        Token::String(model_response_context),
+        Token::String(model_response)
     ]);
 
     hasher.update(b"|ollama_signature_parameters|");
