@@ -86,7 +86,7 @@ async fn forward(
 
     ollama_request_body.stream = Some(false);
 
-    let model_prompt = &ollama_request_body.messages[0].content;
+    let model_prompt = &ollama_request_body.messages[1].content;
 
     let mut res = forwarded_req
         .send_json(&ollama_request_body)
@@ -125,12 +125,14 @@ async fn forward(
         Token::String(model_prompt.to_owned()),
         Token::String(model_response)
     ]);
-
+    log::info!("abi output : {}",hex::encode(receipt.clone()));
     hasher.update(b"|ollama_signature_parameters|");
     hasher.update(&receipt);
 
     let mut hash = [0u8; 32];
     hasher.finalize(&mut hash);
+
+    log::info!("hash : {}",hex::encode(hash));
 
     let (rs, v) = signer.sign_prehash_recoverable(&hash).unwrap();
 
