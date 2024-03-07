@@ -107,12 +107,12 @@ async fn forward(
 
     hasher.update(b"|oyster-hasher|");
 
+
+
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    hasher.update(b"|timestamp|");
-    hasher.update(&timestamp.to_be_bytes());
 
     let body = res.body().await?;
     let ollama_response: OllamaResponse = serde_json::from_str(from_utf8(&body)?)?;
@@ -123,7 +123,8 @@ async fn forward(
     let receipt = ethabi::encode(&[
         Token::String(model_name),
         Token::String(model_prompt.to_owned()),
-        Token::String(model_response)
+        Token::String(model_response),
+        Token::String(timestamp.to_string())
     ]);
     log::info!("abi output : {}",hex::encode(receipt.clone()));
     hasher.update(b"|ollama_signature_parameters|");
