@@ -54,18 +54,20 @@ async fn forward(
     peer_addr: Option<PeerAddr>,
     url: web::Data<Url>,
     client: web::Data<Client>,
+    redirect_destination: web::Data<String>,
 ) -> Result<HttpResponse, Error> {
     let mut new_url = (**url).clone();
     new_url.set_path(req.uri().path());
     new_url.set_query(req.uri().query());
+    log::info!("Redirect destination: {}", redirect_destination.to_string());
     let forwarded_req = client
         .request_from(new_url.as_str(), req.head())
         .no_decompress()
         .timeout(Duration::new(300, 0));
 
     let forwarded_req = match peer_addr {
-        Some(PeerAddr(addr)) => {
-            forwarded_req.insert_header(("x-forwarded-for", addr.ip().to_string()))
+        Some(PeerAddr(_addr)) => {
+            forwarded_req.insert_header(("Host", redirect_destination.to_string()))
         }
         None => forwarded_req,
     };
@@ -161,6 +163,8 @@ async fn main() -> std::io::Result<()> {
 
     let args = CliArguments::parse();
 
+    let redirect_destination = format!("{}:{}", args.forward_addr, args.forward_port);
+
     let forward_socket_addr = (args.forward_addr, args.forward_port)
         .to_socket_addrs()?
         .next()
@@ -181,6 +185,7 @@ async fn main() -> std::io::Result<()> {
         App::new()
             .app_data(web::Data::new(Client::default()))
             .app_data(web::Data::new(forward_url.clone()))
+            .app_data(web::Data::new(redirect_destination.clone()))
             .wrap(middleware::Logger::default())
             .default_service(web::to(forward))
     })
