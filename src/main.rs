@@ -24,12 +24,12 @@ pub struct OllamaResponse {
     pub created_at: String,
     pub response: String,
     pub done: bool,
-    pub context: Vec<u32>,
-    pub total_duration: u128,
-    pub load_duration: u128,
-    pub prompt_eval_duration: u128,
-    pub eval_count: u128,
-    pub eval_duration: u128,
+    pub context: Option<Vec<u32>>,
+    pub total_duration: Option<u128>,
+    pub load_duration: Option<u128>,
+    pub prompt_eval_duration: Option<u128>,
+    pub eval_count: Option<u128>,
+    pub eval_duration: Option<u128>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -41,6 +41,13 @@ pub struct OllamaConvertedResponse {
     pub msg: String,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct OllamaRequest {
+    pub model: String,
+    pub prompt: String,
+    pub stream: Option<bool>,
+    pub context: Option<Vec<u128>>,
+}
 
 #[derive(Debug, PartialEq)]
 pub struct OllamaSignatureParameters {
@@ -54,7 +61,7 @@ pub struct OllamaSignatureParameters {
 /// Forwards the incoming HTTP request using `awc`.
 async fn forward(
     req: HttpRequest,
-    payload: web::Payload,
+    mut payload: web::Payload,
     peer_addr: Option<PeerAddr>,
     url: web::Data<Url>,
     client: web::Data<Client>,
@@ -76,8 +83,17 @@ async fn forward(
         None => forwarded_req,
     };
 
+    let mut ollama_request_bytes = BytesMut::new();
+    while let Some(item) = payload.next().await {
+        let item = item?;
+        ollama_request_bytes.extend_from_slice(&item);
+    }
+
+    let mut ollama_request_body: OllamaRequest =
+        serde_json::from_str(from_utf8(&ollama_request_bytes)?)?;
+
     let res = forwarded_req
-        .send_stream(payload)
+        .send_json(&ollama_request_body)
         .await
         .map_err(error::ErrorInternalServerError)?;
 
