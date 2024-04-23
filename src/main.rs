@@ -1,19 +1,21 @@
 use std::{net::ToSocketAddrs, str::from_utf8};
 
+use actix_web::web::Bytes;
 use actix_web::web::BytesMut;
 use actix_web::{
     dev::PeerAddr, error, middleware, web, App, Error, HttpRequest, HttpResponse, HttpServer,
 };
 use anyhow::Context;
+use awc::error::PayloadError;
 use awc::Client;
 use clap::Parser;
 use ethabi::Token;
+use futures_util::StreamExt;
 use k256::elliptic_curve::generic_array::sequence::Lengthen;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tiny_keccak::{Hasher, Keccak};
 use tokio::fs;
-use tokio_stream::StreamExt;
 use url::Url;
 
 #[derive(Debug, Deserialize)]
@@ -30,13 +32,15 @@ pub struct OllamaResponse {
     pub eval_duration: u128,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct OllamaRequest {
+#[derive(Debug, Deserialize, Serialize)]
+pub struct OllamaConvertedResponse {
     pub model: String,
-    pub prompt: String,
-    pub stream: Option<bool>,
-    pub context: Option<Vec<u128>>,
+    pub created_at: String,
+    pub response: String,
+    pub done: bool,
+    pub msg: String,
 }
+
 
 #[derive(Debug, PartialEq)]
 pub struct OllamaSignatureParameters {
@@ -50,7 +54,7 @@ pub struct OllamaSignatureParameters {
 /// Forwards the incoming HTTP request using `awc`.
 async fn forward(
     req: HttpRequest,
-    mut payload: web::Payload,
+    payload: web::Payload,
     peer_addr: Option<PeerAddr>,
     url: web::Data<Url>,
     client: web::Data<Client>,
@@ -72,81 +76,37 @@ async fn forward(
         None => forwarded_req,
     };
 
-    let mut ollama_request_bytes = BytesMut::new();
-    while let Some(item) = payload.next().await {
-        let item = item?;
-        ollama_request_bytes.extend_from_slice(&item);
-    }
-
-    let mut ollama_request_body: OllamaRequest =
-        serde_json::from_str(from_utf8(&ollama_request_bytes)?)?;
-
-    ollama_request_body.stream = Some(false);
-
-    let model_prompt = &ollama_request_body.prompt;
-    let model_request_context = match &ollama_request_body.context {
-        Some(data) => serde_json::to_string(data)?,
-        None => "[]".to_string(),
-    };
-
-    let mut res = forwarded_req
-        .send_json(&ollama_request_body)
+    let res = forwarded_req
+        .send_stream(payload)
         .await
         .map_err(error::ErrorInternalServerError)?;
-
-    let signer = k256::ecdsa::SigningKey::from_slice(
-        fs::read("../app/secp.sec")
-            .await
-            .context("failed to read signer key")
-            .unwrap()
-            .as_slice(),
-    )
-    .context("invalid signer key")
-    .unwrap();
-
-    let mut hasher = Keccak::v256();
-
-    hasher.update(b"|oyster-hasher|");
-
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    hasher.update(b"|timestamp|");
-    hasher.update(&timestamp.to_be_bytes());
-
-    let body = res.body().await?;
-    let ollama_response: OllamaResponse = serde_json::from_str(from_utf8(&body)?)?;
-    let model_name = ollama_response.model;
-    let model_response = ollama_response.response;
-    let model_response_context = serde_json::to_string(&ollama_response.context)?;
-
-    let receipt = ethabi::encode(&[
-        Token::String(model_name),
-        Token::String(model_prompt.to_owned()),
-        Token::String(model_request_context),
-        Token::String(model_response),
-        Token::String(model_response_context),
-    ]);
-
-    hasher.update(b"|ollama_signature_parameters|");
-    hasher.update(&receipt);
-
-    let mut hash = [0u8; 32];
-    hasher.finalize(&mut hash);
-
-    let (rs, v) = signer.sign_prehash_recoverable(&hash).unwrap();
-
-    let signature = rs.to_bytes().append(27 + v.to_byte());
 
     let mut client_resp = HttpResponse::build(res.status());
     for (header_name, header_value) in res.headers().iter().filter(|(h, _)| *h != "connection") {
         client_resp.insert_header((header_name.clone(), header_value.clone()));
     }
 
-    client_resp.insert_header(("X-Oyster-Timestamp", timestamp.to_string()));
-    client_resp.insert_header(("X-Oyster-Signature", hex::encode(signature.as_slice())));
-    Ok(client_resp.body(body))
+    let stream_res = res.map(|chunks| {
+        let ollama_json_value: OllamaResponse = serde_json::from_slice(&chunks.unwrap())
+            .map_err(|e| {
+                error::ErrorInternalServerError(format!("Error deserializing JSON: {}", e))
+            })
+            .unwrap();
+        print!("{:#?}", ollama_json_value);
+        let converted_res = OllamaConvertedResponse {
+            done: ollama_json_value.done,
+            created_at: ollama_json_value.created_at,
+            model: ollama_json_value.model,
+            response: ollama_json_value.response,
+            msg: "Sample".to_string(),
+        };
+
+        let final_response: Result<Bytes, PayloadError> =
+            Ok(Bytes::from(serde_json::to_string(&converted_res).unwrap()));
+        final_response
+    });
+    // Processed each item, no action needed here
+    Ok(client_resp.streaming(stream_res))
 }
 
 #[derive(clap::Parser, Debug)]
