@@ -33,12 +33,25 @@ pub struct OllamaResponse {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-pub struct OllamaConvertedResponse {
+pub struct OllamaConvertedResponseForOngoingInferencing {
     pub model: String,
     pub created_at: String,
     pub response: String,
     pub done: bool,
-    pub msg: String,
+    pub oyster_signature: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct OllamaConvertedResponseForCompletedInferencing {
+    pub model: String,
+    pub created_at: String,
+    pub done: bool,
+    pub context: Option<Vec<u32>>,
+    pub total_duration: Option<u128>,
+    pub load_duration: Option<u128>,
+    pub prompt_eval_duration: Option<u128>,
+    pub eval_count: Option<u128>,
+    pub eval_duration: Option<u128>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -89,8 +102,14 @@ async fn forward(
         ollama_request_bytes.extend_from_slice(&item);
     }
 
-    let mut ollama_request_body: OllamaRequest =
+    let ollama_request_body: OllamaRequest =
         serde_json::from_str(from_utf8(&ollama_request_bytes)?)?;
+
+    let model_prompt = ollama_request_body.prompt.clone();
+    let model_request_context = match &ollama_request_body.context.clone() {
+        Some(data) => serde_json::to_string(data)?,
+        None => "[]".to_string(),
+    };
 
     let res = forwarded_req
         .send_json(&ollama_request_body)
@@ -102,26 +121,83 @@ async fn forward(
         client_resp.insert_header((header_name.clone(), header_value.clone()));
     }
 
-    let stream_res = res.map(|chunks| {
+    let signer = k256::ecdsa::SigningKey::from_slice(
+        fs::read("../app/secp.sec")
+            .await
+            .context("failed to read signer key")
+            .unwrap()
+            .as_slice(),
+    )
+    .context("invalid signer key")
+    .unwrap();
+
+    let stream_res = res.map(move |chunks| {
         let ollama_json_value: OllamaResponse = serde_json::from_slice(&chunks.unwrap())
             .map_err(|e| {
                 error::ErrorInternalServerError(format!("Error deserializing JSON: {}", e))
             })
             .unwrap();
-        print!("{:#?}", ollama_json_value);
-        let converted_res = OllamaConvertedResponse {
-            done: ollama_json_value.done,
-            created_at: ollama_json_value.created_at,
-            model: ollama_json_value.model,
-            response: ollama_json_value.response,
-            msg: "Sample".to_string(),
+
+        let mut hasher = Keccak::v256();
+
+        hasher.update(b"|oyster-hasher|");
+
+        hasher.update(b"|timestamp|");
+        hasher.update(ollama_json_value.created_at.as_bytes());
+
+        let model_name = ollama_json_value.model;
+        let model_response = ollama_json_value.response;
+        let model_response_context = serde_json::to_string(&ollama_json_value.context).unwrap();
+
+        let receipt = ethabi::encode(&[
+            Token::String(model_name.clone()),
+            Token::String(model_prompt.clone()),
+            Token::String(model_request_context.clone()),
+            Token::String(model_response.clone()),
+            Token::String(model_response_context),
+        ]);
+
+        hasher.update(b"|ollama_signature_parameters|");
+        hasher.update(&receipt);
+
+        let mut hash = [0u8; 32];
+        hasher.finalize(&mut hash);
+
+        let (rs, v) = signer.sign_prehash_recoverable(&hash).unwrap();
+
+        let signature = rs.to_bytes().append(27 + v.to_byte());
+
+        if ollama_json_value.done {
+            let converted_resp_for_completed_inferencing = OllamaConvertedResponseForCompletedInferencing {
+                done: ollama_json_value.done,
+                created_at: ollama_json_value.created_at,
+                model: model_name,
+                context: ollama_json_value.context,
+                eval_count: ollama_json_value.eval_count,
+                eval_duration: ollama_json_value.eval_duration,
+                load_duration: ollama_json_value.load_duration,
+                prompt_eval_duration: ollama_json_value.prompt_eval_duration,
+                total_duration: ollama_json_value.total_duration,
+            };
+            let final_response: Result<Bytes, PayloadError> =
+                Ok(Bytes::from(serde_json::to_string(&converted_resp_for_completed_inferencing).unwrap()));
+            return final_response
+        } else {
+            let converted_resp_for_completed_inferencing = OllamaConvertedResponseForOngoingInferencing {
+                done: ollama_json_value.done,
+                created_at: ollama_json_value.created_at,
+                model: model_name,
+                response: model_response,
+                oyster_signature: Some(hex::encode(signature.as_slice())),
+            };
+            let final_response: Result<Bytes, PayloadError> =
+                Ok(Bytes::from(serde_json::to_string(&converted_resp_for_completed_inferencing).unwrap()));
+            return final_response
         };
 
-        let final_response: Result<Bytes, PayloadError> =
-            Ok(Bytes::from(serde_json::to_string(&converted_res).unwrap()));
-        final_response
+        
     });
-    // Processed each item, no action needed here
+
     Ok(client_resp.streaming(stream_res))
 }
 
