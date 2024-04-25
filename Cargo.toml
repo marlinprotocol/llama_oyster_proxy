@@ -26,3 +26,4 @@ alloy-rlp = {version="0.3.4",features=["derive"]}
 alloy-sol-types = "0.6.3"
 alloy-sol-macro = "0.6.3"
 ethabi = "18.0.0"
+actix-cors = "0.7.0"

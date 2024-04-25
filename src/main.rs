@@ -1,5 +1,7 @@
 use std::{net::ToSocketAddrs, str::from_utf8};
 
+use actix_cors::Cors;
+use actix_web::http::header;
 use actix_web::web::Bytes;
 use actix_web::web::BytesMut;
 use actix_web::{
@@ -142,19 +144,18 @@ async fn forward(
 
         hasher.update(b"|oyster-hasher|");
 
-        hasher.update(b"|timestamp|");
-        hasher.update(ollama_json_value.created_at.as_bytes());
+
 
         let model_name = ollama_json_value.model;
         let model_response = ollama_json_value.response;
-        let model_response_context = serde_json::to_string(&ollama_json_value.context).unwrap();
+        let timestamp = ollama_json_value.created_at.clone();
 
         let receipt = ethabi::encode(&[
             Token::String(model_name.clone()),
             Token::String(model_prompt.clone()),
             Token::String(model_request_context.clone()),
             Token::String(model_response.clone()),
-            Token::String(model_response_context),
+            Token::String(timestamp),
         ]);
 
         hasher.update(b"|ollama_signature_parameters|");
@@ -168,36 +169,37 @@ async fn forward(
         let signature = rs.to_bytes().append(27 + v.to_byte());
 
         if ollama_json_value.done {
-            let converted_resp_for_completed_inferencing = OllamaConvertedResponseForCompletedInferencing {
-                done: ollama_json_value.done,
-                created_at: ollama_json_value.created_at,
-                model: model_name,
-                context: ollama_json_value.context,
-                eval_count: ollama_json_value.eval_count,
-                eval_duration: ollama_json_value.eval_duration,
-                load_duration: ollama_json_value.load_duration,
-                prompt_eval_duration: ollama_json_value.prompt_eval_duration,
-                total_duration: ollama_json_value.total_duration,
-            };
-            let final_response: Result<Bytes, PayloadError> =
-                Ok(Bytes::from(serde_json::to_string(&converted_resp_for_completed_inferencing).unwrap()));
-            return final_response
+            let converted_resp_for_completed_inferencing =
+                OllamaConvertedResponseForCompletedInferencing {
+                    done: ollama_json_value.done,
+                    created_at: ollama_json_value.created_at,
+                    model: model_name,
+                    context: ollama_json_value.context,
+                    eval_count: ollama_json_value.eval_count,
+                    eval_duration: ollama_json_value.eval_duration,
+                    load_duration: ollama_json_value.load_duration,
+                    prompt_eval_duration: ollama_json_value.prompt_eval_duration,
+                    total_duration: ollama_json_value.total_duration,
+                };
+            let final_response: Result<Bytes, PayloadError> = Ok(Bytes::from(
+                serde_json::to_string(&converted_resp_for_completed_inferencing).unwrap(),
+            ));
+            return final_response;
         } else {
-            let converted_resp_for_completed_inferencing = OllamaConvertedResponseForOngoingInferencing {
-                done: ollama_json_value.done,
-                created_at: ollama_json_value.created_at,
-                model: model_name,
-                response: model_response,
-                oyster_signature: Some(hex::encode(signature.as_slice())),
-            };
-            let final_response: Result<Bytes, PayloadError> =
-                Ok(Bytes::from(serde_json::to_string(&converted_resp_for_completed_inferencing).unwrap()));
-            return final_response
+            let converted_resp_for_completed_inferencing =
+                OllamaConvertedResponseForOngoingInferencing {
+                    done: ollama_json_value.done,
+                    created_at: ollama_json_value.created_at,
+                    model: model_name,
+                    response: model_response,
+                    oyster_signature: Some(hex::encode(signature.as_slice())),
+                };
+            let final_response: Result<Bytes, PayloadError> = Ok(Bytes::from(
+                serde_json::to_string(&converted_resp_for_completed_inferencing).unwrap(),
+            ));
+            return final_response;
         };
-
-        
     });
-
     Ok(client_resp.streaming(stream_res))
 }
 
@@ -238,6 +240,13 @@ async fn main() -> std::io::Result<()> {
             .app_data(web::Data::new(Client::default()))
             .app_data(web::Data::new(forward_url.clone()))
             .app_data(web::Data::new(redirect_destination.clone()))
+            .wrap(
+                Cors::default()
+                    .allowed_origin("http://localhost:3000")
+                    .allowed_methods(vec!["GET", "POST"])
+                    .allowed_headers(vec![header::AUTHORIZATION, header::ACCEPT])
+                    .allowed_header(header::CONTENT_TYPE),
+            )
             .wrap(middleware::Logger::default())
             .default_service(web::to(forward))
     })
