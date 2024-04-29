@@ -106,7 +106,6 @@ async fn forward(
     new_url.set_query(req.uri().query());
 
     let count = Arc::clone(&counter_data.counter);
-    log::info!("Number of active connections : {}",count);
 
     log::info!("Redirect destination: {}", redirect_destination.to_string());
     let forwarded_req = client
@@ -207,6 +206,7 @@ async fn forward(
             ));
             return final_response;
         } else {
+            log::info!("Number of active connections : {}",Arc::strong_count(&count));
             let converted_resp_for_completed_inferencing =
                 OllamaConvertedResponseForOngoingInferencing {
                     done: ollama_json_value.done,
@@ -221,7 +221,6 @@ async fn forward(
             return final_response;
         };
     });
-
     Ok(client_resp.streaming(stream_res))
 }
 
