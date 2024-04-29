@@ -1,24 +1,33 @@
 use std::{net::ToSocketAddrs, str::from_utf8};
 
 use actix_cors::Cors;
+use actix_web::get;
 use actix_web::http::header;
 use actix_web::web::Bytes;
 use actix_web::web::BytesMut;
+use actix_web::Responder;
 use actix_web::{
     dev::PeerAddr, error, middleware, web, App, Error, HttpRequest, HttpResponse, HttpServer,
 };
 use anyhow::Context;
 use awc::error::PayloadError;
+use awc::http::StatusCode;
 use awc::Client;
 use clap::Parser;
 use ethabi::Token;
 use futures_util::StreamExt;
 use k256::elliptic_curve::generic_array::sequence::Lengthen;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
+use std::sync::Mutex;
 use std::time::Duration;
 use tiny_keccak::{Hasher, Keccak};
 use tokio::fs;
 use url::Url;
+
+pub struct AppStateWithCounter {
+    pub counter: Mutex<i32>, 
+}
 
 #[derive(Debug, Deserialize)]
 pub struct OllamaResponse {
@@ -73,6 +82,15 @@ pub struct OllamaSignatureParameters {
     pub response: String,
 }
 
+#[get("/getNumberOfPeopleInQueue")]
+async fn get_number_of_people_in_queue(
+    counter_data: web::Data<AppStateWithCounter>,
+) -> impl Responder {
+    let number_of_people_in_queue = &counter_data.counter;
+    let response = json!({"number_of_people_in_queue":number_of_people_in_queue});
+    HttpResponse::build(StatusCode::OK).json(response)
+}
+
 /// Forwards the incoming HTTP request using `awc`.
 async fn forward(
     req: HttpRequest,
@@ -81,10 +99,15 @@ async fn forward(
     url: web::Data<Url>,
     client: web::Data<Client>,
     redirect_destination: web::Data<String>,
+    counter_data: web::Data<AppStateWithCounter>,
 ) -> Result<HttpResponse, Error> {
     let mut new_url = (**url).clone();
     new_url.set_path(req.uri().path());
     new_url.set_query(req.uri().query());
+
+    let mut counter = counter_data.counter.lock().unwrap();
+    *counter += 1;
+
     log::info!("Redirect destination: {}", redirect_destination.to_string());
     let forwarded_req = client
         .request_from(new_url.as_str(), req.head())
@@ -124,7 +147,7 @@ async fn forward(
     }
 
     let signer = k256::ecdsa::SigningKey::from_slice(
-        fs::read("../app/secp.sec")
+        fs::read("../app/secp256k1.sec")
             .await
             .context("failed to read signer key")
             .unwrap()
@@ -143,8 +166,6 @@ async fn forward(
         let mut hasher = Keccak::v256();
 
         hasher.update(b"|oyster-hasher|");
-
-
 
         let model_name = ollama_json_value.model;
         let model_response = ollama_json_value.response;
@@ -200,6 +221,7 @@ async fn forward(
             return final_response;
         };
     });
+
     Ok(client_resp.streaming(stream_res))
 }
 
@@ -214,6 +236,10 @@ struct CliArguments {
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     env_logger::init_from_env(env_logger::Env::new().default_filter_or("info"));
+
+    let counter = web::Data::new(AppStateWithCounter {
+        counter: Mutex::new(0),
+    });
 
     let args = CliArguments::parse();
 
@@ -237,18 +263,21 @@ async fn main() -> std::io::Result<()> {
 
     HttpServer::new(move || {
         App::new()
+            .app_data(counter.clone())
             .app_data(web::Data::new(Client::default()))
             .app_data(web::Data::new(forward_url.clone()))
             .app_data(web::Data::new(redirect_destination.clone()))
             .wrap(
                 Cors::default()
                     .allowed_origin("http://localhost:3000")
+                    .allowed_origin("https://oyster.chat")
                     .allowed_methods(vec!["GET", "POST"])
                     .allowed_headers(vec![header::AUTHORIZATION, header::ACCEPT])
                     .allowed_header(header::CONTENT_TYPE),
             )
             .wrap(middleware::Logger::default())
             .default_service(web::to(forward))
+            .service(get_number_of_people_in_queue)
     })
     .bind((args.listen_addr, args.listen_port))?
     .workers(2)
