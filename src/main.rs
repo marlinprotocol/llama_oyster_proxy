@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::{net::ToSocketAddrs, str::from_utf8};
 
 use actix_cors::Cors;
@@ -19,14 +20,13 @@ use futures_util::StreamExt;
 use k256::elliptic_curve::generic_array::sequence::Lengthen;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::sync::Mutex;
 use std::time::Duration;
 use tiny_keccak::{Hasher, Keccak};
 use tokio::fs;
 use url::Url;
 
 pub struct AppStateWithCounter {
-    pub counter: Mutex<i32>, 
+    pub counter: Arc<i32>, 
 }
 
 #[derive(Debug, Deserialize)]
@@ -86,8 +86,8 @@ pub struct OllamaSignatureParameters {
 async fn get_number_of_people_in_queue(
     counter_data: web::Data<AppStateWithCounter>,
 ) -> impl Responder {
-    let number_of_people_in_queue = &counter_data.counter;
-    let response = json!({"number_of_people_in_queue":number_of_people_in_queue});
+    let number_of_people_in_queue = Arc::strong_count(&counter_data.counter);
+    let response = json!({"number_of_people_in_queue":number_of_people_in_queue-1});
     HttpResponse::build(StatusCode::OK).json(response)
 }
 
@@ -105,9 +105,8 @@ async fn forward(
     new_url.set_path(req.uri().path());
     new_url.set_query(req.uri().query());
 
-    let mut counter = counter_data.counter.lock().unwrap();
-    *counter += 1;
-    drop(counter);
+    let count = Arc::clone(&counter_data.counter);
+    log::info!("Number of active connections : {}",count);
 
     log::info!("Redirect destination: {}", redirect_destination.to_string());
     let forwarded_req = client
@@ -239,7 +238,7 @@ async fn main() -> std::io::Result<()> {
     env_logger::init_from_env(env_logger::Env::new().default_filter_or("info"));
 
     let counter = web::Data::new(AppStateWithCounter {
-        counter: Mutex::new(0),
+        counter: Arc::new(0),
     });
 
     let args = CliArguments::parse();
