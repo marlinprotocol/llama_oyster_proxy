@@ -107,6 +107,7 @@ async fn forward(
 
     let mut counter = counter_data.counter.lock().unwrap();
     *counter += 1;
+    drop(counter);
 
     log::info!("Redirect destination: {}", redirect_destination.to_string());
     let forwarded_req = client
