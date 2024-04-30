@@ -188,7 +188,8 @@ async fn forward(
 
         let signature = rs.to_bytes().append(27 + v.to_byte());
 
-        if ollama_json_value.done {
+        if ollama_json_value.done == true {
+            log::info!("Number of active connections : {}",Arc::strong_count(&count));
             let converted_resp_for_completed_inferencing =
                 OllamaConvertedResponseForCompletedInferencing {
                     done: ollama_json_value.done,
@@ -204,9 +205,8 @@ async fn forward(
             let final_response: Result<Bytes, PayloadError> = Ok(Bytes::from(
                 serde_json::to_string(&converted_resp_for_completed_inferencing).unwrap(),
             ));
-            return final_response;
+            return final_response
         } else {
-            log::info!("Number of active connections : {}",Arc::strong_count(&count));
             let converted_resp_for_completed_inferencing =
                 OllamaConvertedResponseForOngoingInferencing {
                     done: ollama_json_value.done,
