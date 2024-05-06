@@ -203,7 +203,7 @@ async fn forward(
                     total_duration: ollama_json_value.total_duration,
                 };
             let final_response: Result<Bytes, PayloadError> = Ok(Bytes::from(
-                serde_json::to_string(&converted_resp_for_completed_inferencing).unwrap(),
+                serde_json::to_string(&converted_resp_for_completed_inferencing).unwrap()+"\n",
             ));
             return final_response
         } else {
@@ -216,7 +216,7 @@ async fn forward(
                     oyster_signature: Some(hex::encode(signature.as_slice())),
                 };
             let final_response: Result<Bytes, PayloadError> = Ok(Bytes::from(
-                serde_json::to_string(&converted_resp_for_completed_inferencing).unwrap(),
+                serde_json::to_string(&converted_resp_for_completed_inferencing).unwrap()+"\n",
             ));
             return final_response;
         };
