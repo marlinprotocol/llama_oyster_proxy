@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::{net::ToSocketAddrs, str::from_utf8};
 
 use actix_cors::Cors;
@@ -20,13 +20,48 @@ use futures_util::StreamExt;
 use k256::elliptic_curve::generic_array::sequence::Lengthen;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::VecDeque;
 use std::time::Duration;
 use tiny_keccak::{Hasher, Keccak};
 use tokio::fs;
 use url::Url;
 
 pub struct AppStateWithCounter {
-    pub counter: Arc<i32>, 
+    pub counter: Arc<i32>,
+}
+
+pub struct PersonQueue {
+    pub queue: Mutex<VecDeque<String>>,
+}
+
+impl PersonQueue {
+    fn new() -> Self {
+        PersonQueue {
+            queue: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    fn enqueue(&self, person: String) {
+        self.queue.lock().unwrap().push_back(person);
+    }
+
+    fn position_of(&self, person: &str) -> Option<usize> {
+        self.queue.lock().unwrap().iter().position(|p| p == person)
+    }
+
+    fn remove(&self, person: &str) -> Option<String> {
+        let mut queue = self.queue.lock().unwrap();
+        if let Some(index) = queue.iter().position(|p| p == person) {
+            Some(queue.remove(index)?)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct PositionInQueueParams {
+    req_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -71,6 +106,7 @@ pub struct OllamaRequest {
     pub prompt: String,
     pub stream: Option<bool>,
     pub context: Option<Vec<u128>>,
+    pub req_id: String,
 }
 
 #[derive(Debug, PartialEq)]
@@ -82,13 +118,18 @@ pub struct OllamaSignatureParameters {
     pub response: String,
 }
 
-#[get("/getNumberOfPeopleInQueue")]
-async fn get_number_of_people_in_queue(
-    counter_data: web::Data<AppStateWithCounter>,
+#[get("/getPositionInQueue")]
+async fn get_position_in_queue(
+    person_queue: web::Data<PersonQueue>,
+    query_params: web::Query<PositionInQueueParams>,
 ) -> impl Responder {
-    let number_of_people_in_queue = Arc::strong_count(&counter_data.counter);
-    let response = json!({"number_of_people_in_queue":number_of_people_in_queue-1});
-    HttpResponse::build(StatusCode::OK).json(response)
+    if let Some(position) = person_queue.position_of(&query_params.req_id) {
+        let response = json!({"Queue position":position+1,"in-queue":true});
+        HttpResponse::build(StatusCode::OK).json(response)
+    } else {
+        let response = json!({"Queue position":"Not in the queue","in-queue":false});
+        HttpResponse::build(StatusCode::OK).json(response)
+    }
 }
 
 /// Forwards the incoming HTTP request using `awc`.
@@ -99,14 +140,11 @@ async fn forward(
     url: web::Data<Url>,
     client: web::Data<Client>,
     redirect_destination: web::Data<String>,
-    counter_data: web::Data<AppStateWithCounter>,
+    person_queue: web::Data<PersonQueue>,
 ) -> Result<HttpResponse, Error> {
     let mut new_url = (**url).clone();
     new_url.set_path(req.uri().path());
     new_url.set_query(req.uri().query());
-
-    let count = Arc::clone(&counter_data.counter);
-
     log::info!("Redirect destination: {}", redirect_destination.to_string());
     let forwarded_req = client
         .request_from(new_url.as_str(), req.head())
@@ -128,6 +166,8 @@ async fn forward(
 
     let ollama_request_body: OllamaRequest =
         serde_json::from_str(from_utf8(&ollama_request_bytes)?)?;
+
+    person_queue.enqueue(ollama_request_body.req_id.clone());
 
     let model_prompt = ollama_request_body.prompt.clone();
     let model_request_context = match &ollama_request_body.context.clone() {
@@ -155,8 +195,9 @@ async fn forward(
     .context("invalid signer key")
     .unwrap();
 
-    let stream_res = res.map(move |chunks| {
-        let ollama_json_value: OllamaResponse = serde_json::from_slice(&chunks.unwrap())
+    let stream_res = res.map(move |chunk_wrapped| {
+        let chunk = chunk_wrapped.unwrap();
+        let ollama_json_value: OllamaResponse = serde_json::from_slice(&chunk)
             .map_err(|e| {
                 error::ErrorInternalServerError(format!("Error deserializing JSON: {}", e))
             })
@@ -187,9 +228,8 @@ async fn forward(
         let (rs, v) = signer.sign_prehash_recoverable(&hash).unwrap();
 
         let signature = rs.to_bytes().append(27 + v.to_byte());
-
         if ollama_json_value.done == true {
-            log::info!("Number of active connections : {}",Arc::strong_count(&count));
+            person_queue.remove(&ollama_request_body.req_id);
             let converted_resp_for_completed_inferencing =
                 OllamaConvertedResponseForCompletedInferencing {
                     done: ollama_json_value.done,
@@ -205,7 +245,7 @@ async fn forward(
             let final_response: Result<Bytes, PayloadError> = Ok(Bytes::from(
                 serde_json::to_string(&converted_resp_for_completed_inferencing).unwrap(),
             ));
-            return final_response
+            return final_response;
         } else {
             let converted_resp_for_completed_inferencing =
                 OllamaConvertedResponseForOngoingInferencing {
@@ -216,7 +256,7 @@ async fn forward(
                     oyster_signature: Some(hex::encode(signature.as_slice())),
                 };
             let final_response: Result<Bytes, PayloadError> = Ok(Bytes::from(
-                serde_json::to_string(&converted_resp_for_completed_inferencing).unwrap()+"\n",
+                serde_json::to_string(&converted_resp_for_completed_inferencing).unwrap() + "\n",
             ));
             return final_response;
         };
@@ -235,9 +275,10 @@ struct CliArguments {
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     env_logger::init_from_env(env_logger::Env::new().default_filter_or("info"));
+    let new_person_queue = PersonQueue::new();
 
-    let counter = web::Data::new(AppStateWithCounter {
-        counter: Arc::new(0),
+    let person_queue = web::Data::new(PersonQueue {
+        queue: new_person_queue.queue,
     });
 
     let args = CliArguments::parse();
@@ -262,7 +303,7 @@ async fn main() -> std::io::Result<()> {
 
     HttpServer::new(move || {
         App::new()
-            .app_data(counter.clone())
+            .app_data(person_queue.clone())
             .app_data(web::Data::new(Client::default()))
             .app_data(web::Data::new(forward_url.clone()))
             .app_data(web::Data::new(redirect_destination.clone()))
@@ -276,7 +317,7 @@ async fn main() -> std::io::Result<()> {
             )
             .wrap(middleware::Logger::default())
             .default_service(web::to(forward))
-            .service(get_number_of_people_in_queue)
+            .service(get_position_in_queue)
     })
     .bind((args.listen_addr, args.listen_port))?
     .workers(2)
