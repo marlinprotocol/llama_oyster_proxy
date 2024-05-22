@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::{net::ToSocketAddrs, str::from_utf8};
 
 use actix_cors::Cors;
@@ -25,10 +25,6 @@ use std::time::Duration;
 use tiny_keccak::{Hasher, Keccak};
 use tokio::fs;
 use url::Url;
-
-pub struct AppStateWithCounter {
-    pub counter: Arc<i32>,
-}
 
 pub struct PersonQueue {
     pub queue: Mutex<VecDeque<String>>,
