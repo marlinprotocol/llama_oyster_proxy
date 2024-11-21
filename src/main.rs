@@ -1,20 +1,33 @@
+use std::sync::Arc;
 use std::{net::ToSocketAddrs, str::from_utf8};
 
+use actix_cors::Cors;
+use actix_web::get;
+use actix_web::http::header;
+use actix_web::web::Bytes;
 use actix_web::web::BytesMut;
+use actix_web::Responder;
 use actix_web::{
     dev::PeerAddr, error, middleware, web, App, Error, HttpRequest, HttpResponse, HttpServer,
 };
 use anyhow::Context;
+use awc::error::PayloadError;
+use awc::http::StatusCode;
 use awc::Client;
 use clap::Parser;
 use ethabi::Token;
+use futures_util::StreamExt;
 use k256::elliptic_curve::generic_array::sequence::Lengthen;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::time::Duration;
 use tiny_keccak::{Hasher, Keccak};
 use tokio::fs;
-use tokio_stream::StreamExt;
 use url::Url;
+
+pub struct AppStateWithCounter {
+    pub counter: Arc<i32>, 
+}
 
 #[derive(Debug, Deserialize)]
 pub struct OllamaResponse {
@@ -22,12 +35,34 @@ pub struct OllamaResponse {
     pub created_at: String,
     pub response: String,
     pub done: bool,
-    pub context: Vec<u32>,
-    pub total_duration: u128,
-    pub load_duration: u128,
-    pub prompt_eval_duration: u128,
-    pub eval_count: u128,
-    pub eval_duration: u128,
+    pub context: Option<Vec<u32>>,
+    pub total_duration: Option<u128>,
+    pub load_duration: Option<u128>,
+    pub prompt_eval_duration: Option<u128>,
+    pub eval_count: Option<u128>,
+    pub eval_duration: Option<u128>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct OllamaConvertedResponseForOngoingInferencing {
+    pub model: String,
+    pub created_at: String,
+    pub response: String,
+    pub done: bool,
+    pub oyster_signature: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct OllamaConvertedResponseForCompletedInferencing {
+    pub model: String,
+    pub created_at: String,
+    pub done: bool,
+    pub context: Option<Vec<u32>>,
+    pub total_duration: Option<u128>,
+    pub load_duration: Option<u128>,
+    pub prompt_eval_duration: Option<u128>,
+    pub eval_count: Option<u128>,
+    pub eval_duration: Option<u128>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -47,6 +82,15 @@ pub struct OllamaSignatureParameters {
     pub response: String,
 }
 
+#[get("/getNumberOfPeopleInQueue")]
+async fn get_number_of_people_in_queue(
+    counter_data: web::Data<AppStateWithCounter>,
+) -> impl Responder {
+    let number_of_people_in_queue = Arc::strong_count(&counter_data.counter);
+    let response = json!({"number_of_people_in_queue":number_of_people_in_queue-1});
+    HttpResponse::build(StatusCode::OK).json(response)
+}
+
 /// Forwards the incoming HTTP request using `awc`.
 async fn forward(
     req: HttpRequest,
@@ -55,10 +99,14 @@ async fn forward(
     url: web::Data<Url>,
     client: web::Data<Client>,
     redirect_destination: web::Data<String>,
+    counter_data: web::Data<AppStateWithCounter>,
 ) -> Result<HttpResponse, Error> {
     let mut new_url = (**url).clone();
     new_url.set_path(req.uri().path());
     new_url.set_query(req.uri().query());
+
+    let count = Arc::clone(&counter_data.counter);
+
     log::info!("Redirect destination: {}", redirect_destination.to_string());
     let forwarded_req = client
         .request_from(new_url.as_str(), req.head())
@@ -78,24 +126,27 @@ async fn forward(
         ollama_request_bytes.extend_from_slice(&item);
     }
 
-    let mut ollama_request_body: OllamaRequest =
+    let ollama_request_body: OllamaRequest =
         serde_json::from_str(from_utf8(&ollama_request_bytes)?)?;
 
-    ollama_request_body.stream = Some(false);
-
-    let model_prompt = &ollama_request_body.prompt;
-    let model_request_context = match &ollama_request_body.context {
+    let model_prompt = ollama_request_body.prompt.clone();
+    let model_request_context = match &ollama_request_body.context.clone() {
         Some(data) => serde_json::to_string(data)?,
         None => "[]".to_string(),
     };
 
-    let mut res = forwarded_req
+    let res = forwarded_req
         .send_json(&ollama_request_body)
         .await
         .map_err(error::ErrorInternalServerError)?;
 
+    let mut client_resp = HttpResponse::build(res.status());
+    for (header_name, header_value) in res.headers().iter().filter(|(h, _)| *h != "connection") {
+        client_resp.insert_header((header_name.clone(), header_value.clone()));
+    }
+
     let signer = k256::ecdsa::SigningKey::from_slice(
-        fs::read("../app/secp.sec")
+        fs::read("../app/secp256k1.sec")
             .await
             .context("failed to read signer key")
             .unwrap()
@@ -104,49 +155,73 @@ async fn forward(
     .context("invalid signer key")
     .unwrap();
 
-    let mut hasher = Keccak::v256();
+    let stream_res = res.map(move |chunks| {
+        let ollama_json_value: OllamaResponse = serde_json::from_slice(&chunks.unwrap())
+            .map_err(|e| {
+                error::ErrorInternalServerError(format!("Error deserializing JSON: {}", e))
+            })
+            .unwrap();
 
-    hasher.update(b"|oyster-hasher|");
+        let mut hasher = Keccak::v256();
 
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    hasher.update(b"|timestamp|");
-    hasher.update(&timestamp.to_be_bytes());
+        hasher.update(b"|oyster-hasher|");
 
-    let body = res.body().await?;
-    let ollama_response: OllamaResponse = serde_json::from_str(from_utf8(&body)?)?;
-    let model_name = ollama_response.model;
-    let model_response = ollama_response.response;
-    let model_response_context = serde_json::to_string(&ollama_response.context)?;
+        let model_name = ollama_json_value.model;
+        let model_response = ollama_json_value.response;
+        let timestamp = ollama_json_value.created_at.clone();
 
-    let receipt = ethabi::encode(&[
-        Token::String(model_name),
-        Token::String(model_prompt.to_owned()),
-        Token::String(model_request_context),
-        Token::String(model_response),
-        Token::String(model_response_context),
-    ]);
+        let receipt = ethabi::encode(&[
+            Token::String(model_name.clone()),
+            Token::String(model_prompt.clone()),
+            Token::String(model_request_context.clone()),
+            Token::String(model_response.clone()),
+            Token::String(timestamp),
+        ]);
 
-    hasher.update(b"|ollama_signature_parameters|");
-    hasher.update(&receipt);
+        hasher.update(b"|ollama_signature_parameters|");
+        hasher.update(&receipt);
 
-    let mut hash = [0u8; 32];
-    hasher.finalize(&mut hash);
+        let mut hash = [0u8; 32];
+        hasher.finalize(&mut hash);
 
-    let (rs, v) = signer.sign_prehash_recoverable(&hash).unwrap();
+        let (rs, v) = signer.sign_prehash_recoverable(&hash).unwrap();
 
-    let signature = rs.to_bytes().append(27 + v.to_byte());
+        let signature = rs.to_bytes().append(27 + v.to_byte());
 
-    let mut client_resp = HttpResponse::build(res.status());
-    for (header_name, header_value) in res.headers().iter().filter(|(h, _)| *h != "connection") {
-        client_resp.insert_header((header_name.clone(), header_value.clone()));
-    }
-
-    client_resp.insert_header(("X-Oyster-Timestamp", timestamp.to_string()));
-    client_resp.insert_header(("X-Oyster-Signature", hex::encode(signature.as_slice())));
-    Ok(client_resp.body(body))
+        if ollama_json_value.done == true {
+            log::info!("Number of active connections : {}",Arc::strong_count(&count));
+            let converted_resp_for_completed_inferencing =
+                OllamaConvertedResponseForCompletedInferencing {
+                    done: ollama_json_value.done,
+                    created_at: ollama_json_value.created_at,
+                    model: model_name,
+                    context: ollama_json_value.context,
+                    eval_count: ollama_json_value.eval_count,
+                    eval_duration: ollama_json_value.eval_duration,
+                    load_duration: ollama_json_value.load_duration,
+                    prompt_eval_duration: ollama_json_value.prompt_eval_duration,
+                    total_duration: ollama_json_value.total_duration,
+                };
+            let final_response: Result<Bytes, PayloadError> = Ok(Bytes::from(
+                serde_json::to_string(&converted_resp_for_completed_inferencing).unwrap(),
+            ));
+            return final_response
+        } else {
+            let converted_resp_for_completed_inferencing =
+                OllamaConvertedResponseForOngoingInferencing {
+                    done: ollama_json_value.done,
+                    created_at: ollama_json_value.created_at,
+                    model: model_name,
+                    response: model_response,
+                    oyster_signature: Some(hex::encode(signature.as_slice())),
+                };
+            let final_response: Result<Bytes, PayloadError> = Ok(Bytes::from(
+                serde_json::to_string(&converted_resp_for_completed_inferencing).unwrap()+"\n",
+            ));
+            return final_response;
+        };
+    });
+    Ok(client_resp.streaming(stream_res))
 }
 
 #[derive(clap::Parser, Debug)]
@@ -160,6 +235,10 @@ struct CliArguments {
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     env_logger::init_from_env(env_logger::Env::new().default_filter_or("info"));
+
+    let counter = web::Data::new(AppStateWithCounter {
+        counter: Arc::new(0),
+    });
 
     let args = CliArguments::parse();
 
@@ -183,11 +262,21 @@ async fn main() -> std::io::Result<()> {
 
     HttpServer::new(move || {
         App::new()
+            .app_data(counter.clone())
             .app_data(web::Data::new(Client::default()))
             .app_data(web::Data::new(forward_url.clone()))
             .app_data(web::Data::new(redirect_destination.clone()))
+            .wrap(
+                Cors::default()
+                    .allowed_origin("http://localhost:3000")
+                    .allowed_origin("https://oyster.chat")
+                    .allowed_methods(vec!["GET", "POST"])
+                    .allowed_headers(vec![header::AUTHORIZATION, header::ACCEPT])
+                    .allowed_header(header::CONTENT_TYPE),
+            )
             .wrap(middleware::Logger::default())
             .default_service(web::to(forward))
+            .service(get_number_of_people_in_queue)
     })
     .bind((args.listen_addr, args.listen_port))?
     .workers(2)
